@@ -7,8 +7,8 @@
 name: check-proxies
 on:
   schedule:
-    - cron: "7,22,37,52 * * * *"
-    - cron: "4 */2 * * *"
+    - cron: "7,22,37,52 * * * *"   # быстрая перепроверка рабочих (не в «круглые» минуты - так GitHub реже пропускает)
+    - cron: "4 */2 * * *"       # полный сбор новых
   workflow_dispatch:
     inputs:
       mode:
@@ -25,11 +25,25 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: pip install aiohttp aiohttp-socks
+      - run: pip install aiohttp aiohttp-socks maxminddb
+      # база стран DB-IP (dbip-country-lite, CC BY 4.0) - скачивается раз в месяц, между запусками хранится в кэше
+      - id: month
+        run: echo "m=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+      - id: geocache
+        uses: actions/cache@v4
+        with:
+          path: geo.mmdb
+          key: geo-${{ steps.month.outputs.m }}
+      - if: steps.geocache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: |
+          m=$(date -u +%Y-%m); p=$(date -u -d "$(date -u +%Y-%m-01) -1 month" +%Y-%m)
+          curl -fsSL "https://download.db-ip.com/free/dbip-country-lite-$m.mmdb.gz" -o geo.gz || curl -fsSL "https://download.db-ip.com/free/dbip-country-lite-$p.mmdb.gz" -o geo.gz
+          gunzip -c geo.gz > geo.mmdb && ls -la geo.mmdb
       - uses: actions/cache/restore@v4
         with:
           path: state
-          key: proxy-state-${{ github.run_id }}
+          key: proxy-state-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: proxy-state-
       - run: python check.py
         env:
@@ -37,10 +51,11 @@ jobs:
           WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
           CONCURRENCY: "1000"
           TIMEOUT: "8"
+          GEO_DB: geo.mmdb
           # запуск по расписанию «раз в 2 часа» или вручную с full -> полный режим, иначе быстрый
           MODE: ${{ (github.event.schedule == '4 */2 * * *' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'alive')) && 'full' || 'alive' }}
       - uses: actions/cache/save@v4
         if: always()
         with:
           path: state
-          key: proxy-state-${{ github.run_id }}
+          key: proxy-state-${{ github.run_id }}-${{ github.run_attempt }}
