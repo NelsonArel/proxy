@@ -7,8 +7,8 @@
 name: check-proxies
 on:
   schedule:
-    - cron: "*/15 * * * *"      # быстрая перепроверка рабочих
-    - cron: "4 */2 * * *"       # полный сбор новых
+    - cron: "7,22,37,52 * * * *"
+    - cron: "4 */2 * * *"
   workflow_dispatch:
     inputs:
       mode:
