@@ -1,12 +1,19 @@
 # Сбор и проверка прокси на серверах GitHub. Память о проверенных - в кэше Actions (state/state.json).
-# Секреты: Settings -> Secrets and variables -> Actions:
-#   RESULT_URL     - вебхук n8n, принимающий список рабочих
-#   WEBHOOK_TOKEN  - (необязательно) общий токен
+# Два режима:
+#   alive - каждые 15 минут: перепроверка уже известных рабочих (без сбора источников), ~1 минута
+#   full  - каждые 2 часа: сбор новых из источников + проверка новых и рабочих
+# Секреты: RESULT_URL (вебхук n8n), WEBHOOK_TOKEN (необязательно).
+# Репозиторий должен быть ПУБЛИЧНЫМ - тогда минуты GitHub Actions не ограничены.
 name: check-proxies
 on:
   schedule:
-    - cron: "4 */2 * * *"       # каждые 2 часа (новые проверяются, рабочие перепроверяются)
-  workflow_dispatch: {}
+    - cron: "*/15 * * * *"      # быстрая перепроверка рабочих
+    - cron: "4 */2 * * *"       # полный сбор новых
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "full - сбор новых и проверка, alive - только перепроверка рабочих"
+        default: "full"
 concurrency:
   group: check-proxies
   cancel-in-progress: false
@@ -19,7 +26,6 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install aiohttp aiohttp-socks
-      # достаём память прошлого запуска
       - uses: actions/cache/restore@v4
         with:
           path: state
@@ -31,7 +37,8 @@ jobs:
           WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
           CONCURRENCY: "1000"
           TIMEOUT: "8"
-      # сохраняем обновлённую память для следующего запуска
+          # запуск по расписанию «раз в 2 часа» или вручную с full -> полный режим, иначе быстрый
+          MODE: ${{ (github.event.schedule == '4 */2 * * *' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'alive')) && 'full' || 'alive' }}
       - uses: actions/cache/save@v4
         if: always()
         with:
