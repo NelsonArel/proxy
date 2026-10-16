@@ -1,24 +1,39 @@
+# Сбор и проверка прокси на серверах GitHub. Память о проверенных - в кэше Actions (state/state.json).
+# Секреты: Settings -> Secrets and variables -> Actions:
+#   RESULT_URL     - вебхук n8n, принимающий список рабочих
+#   WEBHOOK_TOKEN  - (необязательно) общий токен
 name: check-proxies
 on:
   schedule:
-    - cron: "4 * * * *"       
-  workflow_dispatch: {}    
+    - cron: "4 */2 * * *"       # каждые 2 часа (новые проверяются, рабочие перепроверяются)
+  workflow_dispatch: {}
 concurrency:
   group: check-proxies
   cancel-in-progress: false
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install aiohttp aiohttp-socks
+      # достаём память прошлого запуска
+      - uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: proxy-state-${{ github.run_id }}
+          restore-keys: proxy-state-
       - run: python check.py
         env:
-          PENDING_URL: ${{ secrets.PENDING_URL }}
           RESULT_URL: ${{ secrets.RESULT_URL }}
           WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
           CONCURRENCY: "1000"
           TIMEOUT: "8"
+      # сохраняем обновлённую память для следующего запуска
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: state
+          key: proxy-state-${{ github.run_id }}
