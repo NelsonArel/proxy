@@ -21,6 +21,7 @@ RECHECK_ALIVE_MIN = float(os.environ.get("RECHECK_ALIVE_MIN", "10"))   # в бы
 MODE = os.environ.get("MODE", "full")            # full - сбор новых + проверка; alive - только перепроверка рабочих
 RECHECK_DEAD_H = float(os.environ.get("RECHECK_DEAD_H", "24"))
 STATE = os.environ.get("STATE_FILE", "state/state.json")
+GEO = os.environ.get("GEO_DB", "geo.mmdb")        # база стран DB-IP (dbip-country-lite, CC BY 4.0)
 HEADERS = {"Authorization": "Bearer " + AUTH} if AUTH else {}
 
 SOURCES = [
@@ -59,6 +60,22 @@ def norm(line, default):
     if o[0] in (0, 10, 127) or (o[0] == 192 and o[1] == 168) or (o[0] == 172 and 16 <= o[1] <= 31): return None
     return proto, line
 
+_geo = None
+def geo_country(ip):
+    """Страна по своей базе DB-IP: без лимитов и сторонних сайтов. Пусто, если базы нет."""
+    global _geo
+    if _geo is None:
+        try:
+            import maxminddb; _geo = maxminddb.open_database(GEO)
+        except Exception:
+            _geo = False
+    if not _geo or not ip: return ""
+    try:
+        rec = _geo.get(ip) or {}
+        return ((rec.get("country") or {}).get("iso_code") or "").upper()
+    except Exception:
+        return ""
+
 def parse_ip(text):
     m = re.search(r"\d{1,3}(?:\.\d{1,3}){3}", text or ""); ip = m.group(0) if m else None
     cm = re.search(r'"countryCode"\s*:\s*"([A-Z]{2})"', text or "") or re.search(r'"country"\s*:\s*"([A-Z]{2})"', text or "")
@@ -82,7 +99,7 @@ async def check(addr, protos, my, sem):
                 continue
             via, cc = parse_ip(text)
             if via and via != my:
-                return addr, {"status": "alive", "protocol": proto, "country": cc, "latency": int((time.monotonic() - t0) * 1000)}
+                return addr, {"status": "alive", "protocol": proto, "country": geo_country(via) or cc, "exit_ip": via, "latency": int((time.monotonic() - t0) * 1000)}
     return addr, {"status": "dead"}
 
 def load_state():
@@ -144,17 +161,21 @@ async def main():
     for addr, r in res:
         prev = state.get(addr, {})
         rec = {"status": r["status"], "last_checked": t, "added": prev.get("added", t)}
-        if r["status"] == "alive": rec.update(protocol=r["protocol"], country=r["country"], latency=r["latency"])
+        if r["status"] == "alive": rec.update(protocol=r["protocol"], country=r["country"], latency=r["latency"], exit_ip=r.get("exit_ip", ""))
         state[addr] = rec
     # чистим память от мёртвых старше недели, чтобы файл не рос бесконечно
     state = {a: e for a, e in state.items() if not (e["status"] == "dead" and age_min(e.get("last_checked", "")) > 7 * 24 * 60)}
     save_state(state)
 
+    for a, e in state.items():
+        if e["status"] == "alive" and not e.get("country"):
+            e["country"] = geo_country(e.get("exit_ip") or a.split(":")[0])
     alive = [dict(proxy=a, status="alive", protocol=e.get("protocol", ""), country=e.get("country", ""),
                   latency=e.get("latency", 0), last_checked=e.get("last_checked", ""), added=e.get("added", ""))
              for a, e in state.items() if e["status"] == "alive"]
     alive.sort(key=lambda x: x["latency"])
-    print(f"рабочих сейчас: {len(alive)} (проверено в этом запуске {len(res)})", flush=True)
+    no_cc = sum(1 for x in alive if not x["country"])
+    print(f"рабочих сейчас: {len(alive)} (проверено в этом запуске {len(res)}), без страны: {no_cc}, база стран: {'есть' if _geo else 'НЕТ'}", flush=True)
 
     # в n8n - одним запросом весь актуальный список рабочих: n8n заменяет им таблицу
     async with aiohttp.ClientSession(headers=HEADERS) as s:
