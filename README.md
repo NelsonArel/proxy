@@ -1,5 +1,5 @@
 [README.md](https://github.com/user-attachments/files/33545621/README.md)
-# MakeItEarn - проверка прокси на GitHub Actions
+Проверка прокси на GitHub Actions
 
 Проверяет прокси на серверах GitHub (не с домашнего интернета, не на VPS). Бесплатно:
 публичный репозиторий - без лимита минут.
