@@ -1,0 +1,24 @@
+name: check-proxies
+on:
+  schedule:
+    - cron: "4 * * * *"       
+  workflow_dispatch: {}    
+concurrency:
+  group: check-proxies
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install aiohttp aiohttp-socks
+      - run: python check.py
+        env:
+          PENDING_URL: ${{ secrets.PENDING_URL }}
+          RESULT_URL: ${{ secrets.RESULT_URL }}
+          WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
+          CONCURRENCY: "1000"
+          TIMEOUT: "8"
