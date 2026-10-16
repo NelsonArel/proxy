@@ -17,7 +17,8 @@ RESULT_URL = os.environ["RESULT_URL"]                 # вебхук n8n, при
 AUTH = os.environ.get("WEBHOOK_TOKEN", "")
 CONC = int(os.environ.get("CONCURRENCY", "1000"))
 TIMEOUT = float(os.environ.get("TIMEOUT", "8"))
-RECHECK_ALIVE_MIN = float(os.environ.get("RECHECK_ALIVE_MIN", "55"))
+RECHECK_ALIVE_MIN = float(os.environ.get("RECHECK_ALIVE_MIN", "10"))   # в быстром режиме (каждые 15 мин) рабочие проверяются каждый раз
+MODE = os.environ.get("MODE", "full")            # full - сбор новых + проверка; alive - только перепроверка рабочих
 RECHECK_DEAD_H = float(os.environ.get("RECHECK_DEAD_H", "24"))
 STATE = os.environ.get("STATE_FILE", "state/state.json")
 HEADERS = {"Authorization": "Bearer " + AUTH} if AUTH else {}
@@ -117,8 +118,9 @@ async def main():
             for ln in text.splitlines():
                 p = norm(ln, default)
                 if p: found.setdefault(p[1], set()).add(p[0])
-        await asyncio.gather(*[grab(d, u) for d, u in SOURCES])
-    print(f"собрано {len(found)} уникальных, в памяти {len(state)}, свой ip {my}", flush=True)
+        if MODE == "full":
+            await asyncio.gather(*[grab(d, u) for d, u in SOURCES])
+    print(f"режим {MODE}: собрано {len(found)} уникальных, в памяти {len(state)}, свой ip {my}", flush=True)
 
     # что проверять: новые; рабочие, давно не проверенные; мёртвые, у которых истёк срок
     todo = {}
