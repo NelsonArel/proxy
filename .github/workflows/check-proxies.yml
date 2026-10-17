@@ -14,6 +14,9 @@ on:
       mode:
         description: "full - сбор новых и проверка, alive - только перепроверка рабочих"
         default: "full"
+permissions:
+  contents: read
+  actions: write                # для уборки: удалять старые запуски и копии кэша в этом репозитории
 concurrency:
   group: check-proxies
   cancel-in-progress: false
@@ -49,7 +52,7 @@ jobs:
         env:
           RESULT_URL: ${{ secrets.RESULT_URL }}
           WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
-          CONCURRENCY: "1000"
+          CONCURRENCY: "2000"
           TIMEOUT: "8"
           GEO_DB: geo.mmdb
           # запуск по расписанию «раз в 2 часа» или вручную с full -> полный режим, иначе быстрый
@@ -59,3 +62,19 @@ jobs:
         with:
           path: state
           key: proxy-state-${{ github.run_id }}-${{ github.run_attempt }}
+      # уборка после каждой проверки (раз в 10 минут, запуски из n8n надёжнее расписания):
+      # запуски старше 1 часа и старые копии памяти в кэше (остаются 3 последние)
+      - name: Уборка старых запусков и кэша
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          cutoff=$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)
+          ids=$(gh api --method GET --paginate "repos/$REPO/actions/runs" -f per_page=100 -f status=completed -f created="<$cutoff" --jq '.workflow_runs[].id')
+          n=0; for id in $ids; do gh api -X DELETE "repos/$REPO/actions/runs/$id" >/dev/null && n=$((n+1)); done
+          echo "удалено запусков: $n"
+          ids=$(gh api --method GET "repos/$REPO/actions/caches" -f key=proxy-state- -f sort=created_at -f direction=desc -f per_page=100 --jq '.actions_caches[3:][].id')
+          n=0; for id in $ids; do gh api -X DELETE "repos/$REPO/actions/caches/$id" >/dev/null && n=$((n+1)); done
+          echo "удалено копий кэша: $n"
