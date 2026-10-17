@@ -15,11 +15,13 @@ from aiohttp_socks import ProxyConnector, ProxyType
 
 RESULT_URL = os.environ["RESULT_URL"]                 # вебхук n8n, принимает итоговый список рабочих
 AUTH = os.environ.get("WEBHOOK_TOKEN", "")
-CONC = int(os.environ.get("CONCURRENCY", "1000"))
+CONC = int(os.environ.get("CONCURRENCY", "2000"))
 TIMEOUT = float(os.environ.get("TIMEOUT", "8"))
 RECHECK_ALIVE_MIN = float(os.environ.get("RECHECK_ALIVE_MIN", "10"))   # в быстром режиме (каждые 15 мин) рабочие проверяются каждый раз
 MODE = os.environ.get("MODE", "full")            # full - сбор новых + проверка; alive - только перепроверка рабочих
-RECHECK_DEAD_H = float(os.environ.get("RECHECK_DEAD_H", "24"))
+RECHECK_DEAD_H = float(os.environ.get("RECHECK_DEAD_H", "72"))   # мёртвые - повторно не чаще раза в 3 суток
+NEW_TIMEOUT = float(os.environ.get("NEW_TIMEOUT", "6"))            # таймаут для ещё не проверенных адресов
+MAX_NEW = int(os.environ.get("MAX_NEW", "150000"))                 # не больше стольких непроверенных за полный прогон - остальное в следующих
 STATE = os.environ.get("STATE_FILE", "state/state.json")
 GEO = os.environ.get("GEO_DB", "geo.mmdb")        # база стран DB-IP (dbip-country-lite, CC BY 4.0)
 HEADERS = {"Authorization": "Bearer " + AUTH} if AUTH else {}
@@ -40,6 +42,70 @@ SOURCES = [
   ("socks5", "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt"),
   ("socks5", "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Socks5.txt"),
   ("socks5", "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt"),
+  # ── добавлено в v224: открытые списки на GitHub, проверенные на доступность ──
+  ("socks4", "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks4.txt"),
+  ("socks5", "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt"),
+  ("http", "https://raw.githubusercontent.com/mmpx12/proxy-list/master/http.txt"),
+  ("socks4", "https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks4.txt"),
+  ("socks5", "https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks5.txt"),
+  ("http", "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt"),
+  ("socks4", "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS4_RAW.txt"),
+  ("http", "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/http.txt"),
+  ("http", "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt"),
+  ("socks4", "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/socks4.txt"),
+  ("socks5", "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/socks5.txt"),
+  ("http", "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt"),
+  ("socks4", "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks4.txt"),
+  ("http", "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/http.txt"),
+  ("socks4", "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/socks4.txt"),
+  ("socks5", "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/socks5.txt"),
+  ("http", "https://raw.githubusercontent.com/zloi-user/hideip.me/main/http.txt"),
+  ("http", "https://raw.githubusercontent.com/zloi-user/hideip.me/main/https.txt"),
+  ("socks4", "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks4.txt"),
+  ("socks5", "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks5.txt"),
+  ("http", "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt"),
+  ("http", "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/http_proxies.txt"),
+  ("socks4", "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/socks4_proxies.txt"),
+  ("socks5", "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/socks5_proxies.txt"),
+  ("http", "https://raw.githubusercontent.com/im-razvan/proxy_list/main/http.txt"),
+  ("socks5", "https://raw.githubusercontent.com/im-razvan/proxy_list/main/socks5.txt"),
+  ("http", "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/main/http_proxies.txt"),
+  ("socks4", "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/main/socks4_proxies.txt"),
+  ("socks5", "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/main/socks5_proxies.txt"),
+  ("http", "https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/http.txt"),
+  ("socks5", "https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/socks5.txt"),
+  ("http", "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/generated/http_proxies.txt"),
+  ("http", "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt"),
+  ("socks4", "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks4.txt"),
+  ("socks5", "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt"),
+  ("http", "https://raw.githubusercontent.com/elliottophellia/proxylist/master/results/http/global/http_checked.txt"),
+  ("socks4", "https://raw.githubusercontent.com/elliottophellia/proxylist/master/results/socks4/global/socks4_checked.txt"),
+  ("socks5", "https://raw.githubusercontent.com/elliottophellia/proxylist/master/results/socks5/global/socks5_checked.txt"),
+  ("http", "https://raw.githubusercontent.com/proxy4parsing/proxy-list/main/http.txt"),
+  ("http", "https://raw.githubusercontent.com/saisuiu/Lionkings-Http-Proxys-Proxies/main/free.txt"),
+  ("http", "https://raw.githubusercontent.com/Vann-Dev/proxy-list/main/proxies/http.txt"),
+  ("socks4", "https://raw.githubusercontent.com/Vann-Dev/proxy-list/main/proxies/socks4.txt"),
+  ("socks5", "https://raw.githubusercontent.com/Vann-Dev/proxy-list/main/proxies/socks5.txt"),
+  ("http", "https://raw.githubusercontent.com/Tsprnay/Proxy-lists/master/proxies/http.txt"),
+  ("socks4", "https://raw.githubusercontent.com/Tsprnay/Proxy-lists/master/proxies/socks4.txt"),
+  ("socks5", "https://raw.githubusercontent.com/Tsprnay/Proxy-lists/master/proxies/socks5.txt"),
+  # ── сайты вне GitHub (доступность не проверена заранее: если не ответит - проверка его пропустит) ──
+  ("http", "https://proxyspace.pro/http.txt"),
+  ("http", "https://proxyspace.pro/https.txt"),
+  ("socks4", "https://proxyspace.pro/socks4.txt"),
+  ("socks5", "https://proxyspace.pro/socks5.txt"),
+  ("http", "https://spys.me/proxy.txt"),
+  ("socks5", "https://spys.me/socks.txt"),
+  ("http", "https://www.proxy-list.download/api/v1/get?type=http"),
+  ("http", "https://www.proxy-list.download/api/v1/get?type=https"),
+  ("socks4", "https://www.proxy-list.download/api/v1/get?type=socks4"),
+  ("socks5", "https://www.proxy-list.download/api/v1/get?type=socks5"),
+  ("http", "https://api.openproxylist.xyz/http.txt"),
+  ("socks4", "https://api.openproxylist.xyz/socks4.txt"),
+  ("socks5", "https://api.openproxylist.xyz/socks5.txt"),
+  ("geonode", "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc"),
+  ("geonode", "https://proxylist.geonode.com/api/proxy-list?limit=500&page=2&sort_by=lastChecked&sort_type=desc"),
+  ("geonode", "https://proxylist.geonode.com/api/proxy-list?limit=500&page=3&sort_by=lastChecked&sort_type=desc"),
 ]
 CHECK_URLS = ["http://ip-api.com/json/?fields=query,countryCode", "http://ipinfo.io/json",
               "http://ifconfig.me/all.json", "http://api.ipify.org?format=json", "http://checkip.amazonaws.com"]
@@ -48,6 +114,7 @@ JUDGES = ["http://httpbin.org/headers", "http://azenv.net/", "http://www.proxy-l
 # заголовки-«выдачи» прокси: и в виде X-Forwarded-For (httpbin), и в виде HTTP_X_FORWARDED_FOR (azenv)
 LEAK = re.compile(r"(?i)(?:^|[^a-z0-9])(via|x[-_]forwarded[-_]for|x[-_]forwarded|forwarded|x[-_]real[-_]ip|x[-_]proxy[-_]id|proxy[-_]connection|client[-_]ip)(?:[^a-z0-9]|$)")
 IP_PORT = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}:\d{2,5}$")
+ANY_IP = re.compile(r"(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3}:\d{2,5})(?!\d)")
 RANK = {"socks5": 3, "socks4": 2, "http": 1}
 now_iso = lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -106,13 +173,14 @@ async def anonymity(proto, addr, my):
         return "anonymous" if LEAK.search(text) else "elite"
     return ""
 
-async def check(addr, protos, my, sem):
+async def check(addr, protos, my, sem, timeout=None):
+    timeout = timeout or TIMEOUT
     async with sem:
         for proto in sorted(protos, key=lambda p: -RANK.get(p, 0)):
             t0 = time.monotonic()
             try:
                 async with aiohttp.ClientSession(connector=connector(proto, addr)) as s:
-                    async with s.get(CHECK_URLS[hash(addr) % len(CHECK_URLS)], timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
+                    async with s.get(CHECK_URLS[hash(addr) % len(CHECK_URLS)], timeout=aiohttp.ClientTimeout(total=timeout)) as r:
                         if r.status != 200: continue
                         text = await r.text()
             except Exception:
@@ -151,37 +219,61 @@ async def main():
             except Exception: continue
         # сбор
         found = {}
+        stat = {}
         async def grab(default, url):
             try:
-                async with s.get(url, timeout=aiohttp.ClientTimeout(total=25)) as r: text = await r.text()
-            except Exception: return
-            for ln in text.splitlines():
-                p = norm(ln, default)
-                if p: found.setdefault(p[1], set()).add(p[0])
+                async with s.get(url, timeout=aiohttp.ClientTimeout(total=30)) as r: text = await r.text(errors="ignore")
+            except Exception: stat[url] = -1; return
+            n0 = len(found)
+            if default == "geonode":                      # JSON: data[].ip, port, protocols[]
+                try:
+                    for it in json.loads(text).get("data", []):
+                        for pr in (it.get("protocols") or ["http"]):
+                            p = norm("%s:%s" % (it.get("ip", ""), it.get("port", "")), "http" if pr == "https" else pr)
+                            if p and p[0] in RANK: found.setdefault(p[1], set()).add(p[0])
+                except Exception: pass
+            else:
+                for ln in text.splitlines():
+                    ln = ln.strip()
+                    m = ANY_IP.search(ln)
+                    if not m: continue
+                    pref = re.match(r"^(https?|socks[45])://", ln, re.I)
+                    p = norm((pref.group(0) if pref else "") + m.group(1), default)
+                    if p: found.setdefault(p[1], set()).add(p[0])
+            stat[url] = len(found) - n0
         if MODE == "full":
             await asyncio.gather(*[grab(d, u) for d, u in SOURCES])
-    print(f"режим {MODE}: собрано {len(found)} уникальных, в памяти {len(state)}, свой ip {my}", flush=True)
+    print(f"режим {MODE}: собрано {len(found)} уникальных из {len(SOURCES)} источников, в памяти {len(state)}, свой ip {my}", flush=True)
+    if MODE == "full":
+        dead_src = [u for u, n in stat.items() if n == -1]
+        print(f"источников не ответило: {len(dead_src)}" + (" (" + ", ".join(u.split("/")[2] for u in dead_src[:8]) + ")" if dead_src else ""), flush=True)
 
     # что проверять: новые; рабочие, давно не проверенные; мёртвые, у которых истёк срок
     todo = {}
     for addr, protos in found.items():
         e = state.get(addr)
         if not e:
-            todo[addr] = protos | {"http", "socks5"}; continue
+            todo[addr] = set(protos); continue          # новый - только по заявленному протоколу (втрое быстрее)
         if e["status"] == "alive" and age_min(e.get("last_checked", "")) >= RECHECK_ALIVE_MIN:
             todo[addr] = {e.get("protocol", "http")} | protos
         elif e["status"] == "dead" and age_min(e.get("last_checked", "")) >= RECHECK_DEAD_H * 60:
-            todo[addr] = protos | {"http", "socks5"}
+            todo[addr] = set(protos)
     # рабочие, которые пропали из источников, тоже перепроверяем (иначе протухнут в списке).
     # В быстром режиме (alive) рабочие проверяются ВСЕГДА: запуски идут каждые 10 минут, а с прошлой проверки
     # к этому моменту проходит чуть меньше 10 минут - с порогом по возрасту каждый второй запуск ничего не делал.
     for addr, e in state.items():
         if addr not in todo and e["status"] == "alive" and (MODE == "alive" or age_min(e.get("last_checked", "")) >= RECHECK_ALIVE_MIN):
             todo[addr] = {e.get("protocol", "http"), "http", "socks5"}
-    print(f"проверяем сейчас: {len(todo)}", flush=True)
+    # лимит непроверенных за прогон: рабочие проверяются всегда, остальные - не больше MAX_NEW (остаток - в следующих прогонах)
+    alive_set = {a for a, e in state.items() if e.get("status") == "alive"}
+    rest = [a for a in todo if a not in alive_set]
+    if len(rest) > MAX_NEW:
+        for a in rest[MAX_NEW:]: del todo[a]
+        print(f"непроверенных больше лимита: {len(rest)}, сейчас берём {MAX_NEW}, остальные - в следующих полных прогонах", flush=True)
+    print(f"проверяем сейчас: {len(todo)} (из них рабочих на перепроверку: {len(alive_set & set(todo))})", flush=True)
 
     sem = asyncio.Semaphore(CONC)
-    res = await asyncio.gather(*[check(a, p, my, sem) for a, p in todo.items()])
+    res = await asyncio.gather(*[check(a, p, my, sem, TIMEOUT if a in alive_set else NEW_TIMEOUT) for a, p in todo.items()])
     t = now_iso()
     for addr, r in res:
         prev = state.get(addr, {})
