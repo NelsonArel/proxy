@@ -43,6 +43,10 @@ SOURCES = [
 ]
 CHECK_URLS = ["http://ip-api.com/json/?fields=query,countryCode", "http://ipinfo.io/json",
               "http://ifconfig.me/all.json", "http://api.ipify.org?format=json", "http://checkip.amazonaws.com"]
+# «судьи» анонимности: показывают, какие заголовки дошли до сервера через прокси
+JUDGES = ["http://httpbin.org/headers", "http://azenv.net/", "http://www.proxy-listen.de/azenv.php"]
+# заголовки-«выдачи» прокси: и в виде X-Forwarded-For (httpbin), и в виде HTTP_X_FORWARDED_FOR (azenv)
+LEAK = re.compile(r"(?i)(?:^|[^a-z0-9])(via|x[-_]forwarded[-_]for|x[-_]forwarded|forwarded|x[-_]real[-_]ip|x[-_]proxy[-_]id|proxy[-_]connection|client[-_]ip)(?:[^a-z0-9]|$)")
 IP_PORT = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}:\d{2,5}$")
 RANK = {"socks5": 3, "socks4": 2, "http": 1}
 now_iso = lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -86,6 +90,22 @@ def connector(proto, addr):
     t = {"http": ProxyType.HTTP, "socks4": ProxyType.SOCKS4, "socks5": ProxyType.SOCKS5}[proto]
     return ProxyConnector(proxy_type=t, host=ip, port=int(port), rdns=True)
 
+async def anonymity(proto, addr, my):
+    """SOCKS не добавляет заголовков - элитный. HTTP: если до сервера дошли Via / X-Forwarded-For и т.п.
+    или наш адрес - анонимный (адрес скрыт, но видно, что это прокси); иначе - элитный."""
+    if proto != "http": return "elite"
+    for url in JUDGES:
+        try:
+            async with aiohttp.ClientSession(connector=connector(proto, addr)) as s:
+                async with s.get(url, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
+                    if r.status != 200: continue
+                    text = await r.text()
+        except Exception:
+            continue
+        if my and my in text: return "transparent"
+        return "anonymous" if LEAK.search(text) else "elite"
+    return ""
+
 async def check(addr, protos, my, sem):
     async with sem:
         for proto in sorted(protos, key=lambda p: -RANK.get(p, 0)):
@@ -99,7 +119,10 @@ async def check(addr, protos, my, sem):
                 continue
             via, cc = parse_ip(text)
             if via and via != my:
-                return addr, {"status": "alive", "protocol": proto, "country": geo_country(via) or cc, "exit_ip": via, "latency": int((time.monotonic() - t0) * 1000)}
+                lat = int((time.monotonic() - t0) * 1000)
+                anon = await anonymity(proto, addr, my)
+                if anon == "transparent": return addr, {"status": "dead"}     # выдаёт наш адрес - не годится
+                return addr, {"status": "alive", "protocol": proto, "country": geo_country(via) or cc, "exit_ip": via, "latency": lat, "anonymity": anon}
     return addr, {"status": "dead"}
 
 def load_state():
@@ -149,9 +172,11 @@ async def main():
             todo[addr] = {e.get("protocol", "http")} | protos
         elif e["status"] == "dead" and age_min(e.get("last_checked", "")) >= RECHECK_DEAD_H * 60:
             todo[addr] = protos | {"http", "socks5"}
-    # рабочие, которые пропали из источников, тоже перепроверяем (иначе протухнут в списке)
+    # рабочие, которые пропали из источников, тоже перепроверяем (иначе протухнут в списке).
+    # В быстром режиме (alive) рабочие проверяются ВСЕГДА: запуски идут каждые 10 минут, а с прошлой проверки
+    # к этому моменту проходит чуть меньше 10 минут - с порогом по возрасту каждый второй запуск ничего не делал.
     for addr, e in state.items():
-        if addr not in todo and e["status"] == "alive" and age_min(e.get("last_checked", "")) >= RECHECK_ALIVE_MIN:
+        if addr not in todo and e["status"] == "alive" and (MODE == "alive" or age_min(e.get("last_checked", "")) >= RECHECK_ALIVE_MIN):
             todo[addr] = {e.get("protocol", "http"), "http", "socks5"}
     print(f"проверяем сейчас: {len(todo)}", flush=True)
 
@@ -161,7 +186,7 @@ async def main():
     for addr, r in res:
         prev = state.get(addr, {})
         rec = {"status": r["status"], "last_checked": t, "added": prev.get("added", t)}
-        if r["status"] == "alive": rec.update(protocol=r["protocol"], country=r["country"], latency=r["latency"], exit_ip=r.get("exit_ip", ""))
+        if r["status"] == "alive": rec.update(protocol=r["protocol"], country=r["country"], latency=r["latency"], exit_ip=r.get("exit_ip", ""), anonymity=r.get("anonymity", ""))
         state[addr] = rec
     # чистим память от мёртвых старше недели, чтобы файл не рос бесконечно
     state = {a: e for a, e in state.items() if not (e["status"] == "dead" and age_min(e.get("last_checked", "")) > 7 * 24 * 60)}
@@ -171,7 +196,8 @@ async def main():
         if e["status"] == "alive" and not e.get("country"):
             e["country"] = geo_country(e.get("exit_ip") or a.split(":")[0])
     alive = [dict(proxy=a, status="alive", protocol=e.get("protocol", ""), country=e.get("country", ""),
-                  latency=e.get("latency", 0), last_checked=e.get("last_checked", ""), added=e.get("added", ""))
+                  latency=e.get("latency", 0), last_checked=e.get("last_checked", ""), added=e.get("added", ""),
+                  anonymity=e.get("anonymity") or ("elite" if e.get("protocol") in ("socks4", "socks5") else ""))
              for a, e in state.items() if e["status"] == "alive"]
     alive.sort(key=lambda x: x["latency"])
     no_cc = sum(1 for x in alive if not x["country"])
@@ -181,6 +207,9 @@ async def main():
     async with aiohttp.ClientSession(headers=HEADERS) as s:
         async with s.post(RESULT_URL, json={"alive": alive, "count": len(alive), "updated": t}, timeout=aiohttp.ClientTimeout(total=120)) as r:
             print(f"отправлено в n8n: HTTP {r.status}", flush=True)
+            if r.status >= 300:
+                # запуск станет красным в Actions - сразу видно, что результат не дошёл до таблицы
+                raise SystemExit(f"n8n не принял результат (HTTP {r.status}): проверьте адрес RESULT_URL, включён ли workflow и совпадает ли WEBHOOK_TOKEN")
 
 if __name__ == "__main__":
     asyncio.run(main())
