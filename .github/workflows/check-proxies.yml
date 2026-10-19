@@ -1,7 +1,8 @@
 # Сбор и проверка прокси на серверах GitHub. Память о проверенных - в кэше Actions (state/state.json).
 # Два режима:
 #   alive - каждые 15 минут: перепроверка уже известных рабочих (без сбора источников), ~1 минута
-#   full  - каждые 2 часа: сбор новых из источников + проверка новых и рабочих
+#   full  - каждые 2 часа: сбор новых из источников + перепроверка ВСЕЙ памяти (рабочих и мёртвых - многие оживают);
+#           память сохраняется частями, поэтому даже прерванный прогон не теряет проверенное
 # Секреты: RESULT_URL (вебхук n8n), WEBHOOK_TOKEN (необязательно).
 # Репозиторий должен быть ПУБЛИЧНЫМ - тогда минуты GitHub Actions не ограничены.
 name: check-proxies
@@ -23,7 +24,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 110          # полный прогон проверяет сотни тысяч адресов; скрипт сам останавливается на 95-й минуте и сохраняет память
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -48,11 +49,14 @@ jobs:
           path: state
           key: proxy-state-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: proxy-state-
-      - run: python check.py
+      - run: |
+          ulimit -n 65535 || true      # тысячи одновременных соединений
+          python check.py
         env:
           RESULT_URL: ${{ secrets.RESULT_URL }}
           WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
-          CONCURRENCY: "2000"
+          CONCURRENCY: "3000"
+          TIME_BUDGET_MIN: "95"
           TIMEOUT: "8"
           GEO_DB: geo.mmdb
           # запуск по расписанию «раз в 2 часа» или вручную с full -> полный режим, иначе быстрый
