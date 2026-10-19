@@ -6,6 +6,8 @@
 # Секреты: RESULT_URL (вебхук n8n), WEBHOOK_TOKEN (необязательно).
 # Репозиторий должен быть ПУБЛИЧНЫМ - тогда минуты GitHub Actions не ограничены.
 name: check-proxies
+# название запуска: по нему сайт понимает, идёт быстрая проверка или крупная (и показывает время до обновления)
+run-name: ${{ ((github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'alive') || github.event.schedule == '7,22,37,52 * * * *') && 'alive' || 'full' }} check
 on:
   schedule:
     - cron: "7,22,37,52 * * * *"   # быстрая перепроверка рабочих (не в «круглые» минуты - так GitHub реже пропускает)
