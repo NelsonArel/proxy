@@ -247,6 +247,10 @@ def age_min(iso):
 async def main():
     global MODE
     meta = load_meta()
+    if "last_full" not in meta:   # записи ещё нет (первый запуск новой версии): новые адреса добавляет только крупная проверка -
+        st0 = load_state()          # время самого свежего добавленного адреса и есть время последней крупной
+        added = [e.get("added", "") for e in st0.values() if e.get("added")]
+        if added: meta["last_full"] = max(added); print(f"последняя крупная проверка (по памяти): {meta['last_full']}", flush=True)
     if MODE == "auto":   # запуск от «сторожа» n8n: сами решаем, крупная проверка или быстрая
         MODE = "full" if full_due(meta) else "alive"
         print(f"режим auto -> {MODE}", flush=True)
