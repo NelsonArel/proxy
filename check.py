@@ -21,7 +21,8 @@ AUTH = os.environ.get("WEBHOOK_TOKEN", "")
 CONC = int(os.environ.get("CONCURRENCY", "2000"))
 TIMEOUT = float(os.environ.get("TIMEOUT", "8"))
 RECHECK_ALIVE_MIN = float(os.environ.get("RECHECK_ALIVE_MIN", "10"))   # в быстром режиме (каждые 15 мин) рабочие проверяются каждый раз
-MODE = os.environ.get("MODE", "full")            # full - сбор новых + проверка; alive - только перепроверка рабочих
+MODE = os.environ.get("MODE", "full")            # full - сбор новых + проверка; alive - только перепроверка рабочих; auto - решает сам
+FULL_EVERY_MIN = float(os.environ.get("FULL_EVERY_MIN", "120"))     # крупная проверка - раз в столько минут (цепочка запусков через n8n)
 RECHECK_DEAD_H = float(os.environ.get("RECHECK_DEAD_H", "72"))   # мёртвые - повторно не чаще раза в 3 суток
 NEW_TIMEOUT = float(os.environ.get("NEW_TIMEOUT", "6"))            # таймаут для ещё не проверенных адресов
 MAX_NEW = int(os.environ.get("MAX_NEW", "150000"))                 # не больше стольких непроверенных за полный прогон - остальное в следующих
@@ -39,6 +40,18 @@ CHUNK = int(os.environ.get("CHUNK", "40000"))                      # памят�
 TIME_BUDGET_MIN = float(os.environ.get("TIME_BUDGET_MIN", "95"))   # не начинать новые части позже этого (запуск должен успеть сохраниться)
 PUBLISH_FAILS = int(os.environ.get("PUBLISH_FAILS", "1"))          # в n8n - рабочие, не ответившие не больше стольких раз подряд
 T_START = time.time()
+META = os.path.join(os.path.dirname(os.environ.get("STATE_FILE", "state/state.json")) or ".", "meta.json")   # когда была последняя крупная проверка
+def load_meta():
+    try:
+        with open(META, encoding="utf-8") as f: return json.load(f)
+    except Exception: return {}
+def save_meta(m):
+    os.makedirs(os.path.dirname(META) or ".", exist_ok=True)
+    with open(META + ".tmp", "w", encoding="utf-8") as f: json.dump(m, f)
+    os.replace(META + ".tmp", META)
+def full_due(m):   # пора ли крупную проверку (с запасом 5 минут, чтобы цепочка не «проскакивала» на лишний круг)
+    try: return (time.time() - datetime.fromisoformat(m["last_full"]).timestamp()) / 60 >= FULL_EVERY_MIN - 5
+    except Exception: return True
 SEND_UNTIL_MIN = float(os.environ.get("SEND_UNTIL_MIN", "105"))     # до какой минуты запуска повторять отправку в n8n
 GEO = os.environ.get("GEO_DB", "geo.mmdb")        # база стран DB-IP (dbip-country-lite, CC BY 4.0)
 HEADERS = {"Authorization": "Bearer " + AUTH} if AUTH else {}
@@ -232,6 +245,11 @@ def age_min(iso):
     except Exception: return 1e9
 
 async def main():
+    global MODE
+    meta = load_meta()
+    if MODE == "auto":   # запуск от «сторожа» n8n: сами решаем, крупная проверка или быстрая
+        MODE = "full" if full_due(meta) else "alive"
+        print(f"режим auto -> {MODE}", flush=True)
     state = load_state()   # proxy -> {status, protocol, country, latency, last_checked, added}
     async with aiohttp.ClientSession(headers={"User-Agent": "MakeItEarn-ProxyCheck/2.0"}) as s:
         # свой адрес (чтобы отсеять прозрачные)
@@ -361,7 +379,10 @@ async def main():
     # Нет связи, n8n перезапускается или не отвечает - повторяем с нарастающей паузой (10 с, 20 с, 40 с, дальше раз в минуту),
     # пока n8n не примет. Предел - SEND_UNTIL_MIN минут от начала запуска (запуск на GitHub ограничен по времени);
     # память уже сохранена выше, а следующий запуск отправит более свежий список.
-    payload = {"alive": alive, "count": len(alive), "updated": now_iso()}
+    if MODE != "alive": meta["last_full"] = datetime.fromtimestamp(T_START, timezone.utc).isoformat(timespec="seconds"); save_meta(meta)
+    next_mode = "full" if full_due(meta) else "alive"   # n8n через минуту запустит именно такую проверку
+    payload = {"alive": alive, "count": len(alive), "updated": now_iso(), "mode": MODE, "next_mode": next_mode, "minutes": round((time.time() - T_START) / 60, 1), "run_id": os.environ.get("GITHUB_RUN_ID", "")}
+    print(f"следующая проверка: {'крупная' if next_mode == 'full' else 'быстрая'}", flush=True)
     deadline = T_START + SEND_UNTIL_MIN * 60
     attempt, pause, last_err = 0, 10, ""
     while True:
