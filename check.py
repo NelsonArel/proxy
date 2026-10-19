@@ -6,11 +6,12 @@
 Память хранится в файле state.json между запусками (кэш GitHub Actions), поэтому:
   - новые адреса проверяются один раз, дальше - по расписанию ниже;
   - рабочие перепроверяются каждый запуск ОТДЕЛЬНО от новых (своя умеренная нагрузка), с повтором при неудаче;
-    из рабочих прокси выбывает только после ALIVE_FAILS неудач подряд (бесплатные прокси «мигают»);
+    на сайт выставляются ТОЛЬКО прокси, ответившие при последней проверке (PUBLISH_FAILS=0);
+    не ответивший перепроверяется в следующем запуске (любом), не ответил снова (ALIVE_FAILS=2 подряд) - убирается из рабочих;
   - мёртвые перепроверяются по нарастающей (2 ч, 6 ч, 24 ч, 72 ч) - даже если источник их уже убрал:
     многие бесплатные прокси через время снова начинают работать;
   - мёртвые хранятся KEEP_DEAD_D дней с последней удачной проверки.
-Поля результата: proxy, status, protocol, country, latency, last_checked, added."""
+Поля результата: proxy, status, protocol, country, latency, last_checked, added, anonymity, run (метка выпуска)."""
 import asyncio, json, os, random, re, time
 from datetime import datetime, timezone
 import aiohttp
@@ -27,7 +28,7 @@ RECHECK_DEAD_H = float(os.environ.get("RECHECK_DEAD_H", "72"))   # мёртвы�
 NEW_TIMEOUT = float(os.environ.get("NEW_TIMEOUT", "6"))            # таймаут для ещё не проверенных адресов
 MAX_NEW = int(os.environ.get("MAX_NEW", "150000"))                 # не больше стольких непроверенных за полный прогон - остальное в следующих
 STATE = os.environ.get("STATE_FILE", "state/state.json")
-ALIVE_FAILS = int(os.environ.get("ALIVE_FAILS", "3"))              # из рабочих - только после стольких неудач подряд
+ALIVE_FAILS = int(os.environ.get("ALIVE_FAILS", "2"))              # неудача + повторная неудача в следующем запуске = убрать из рабочих
 ALIVE_CONC = int(os.environ.get("ALIVE_CONCURRENCY", "400"))       # рабочие - отдельно и без перегрузки (иначе ложные «смерти»)
 ALIVE_TIMEOUT = float(os.environ.get("ALIVE_TIMEOUT", "10"))
 RETRY_TIMEOUT = float(os.environ.get("RETRY_TIMEOUT", "15"))       # повтор не ответившего рабочего - другой адрес проверки, дольше
@@ -38,7 +39,7 @@ RECHECK_ALL = os.environ.get("RECHECK_ALL", "1") == "1"            # полны�
 CONNECT_TIMEOUT = float(os.environ.get("CONNECT_TIMEOUT", "4"))    # мёртвые обычно не отвечают даже на подключение - не ждём их весь таймаут
 CHUNK = int(os.environ.get("CHUNK", "40000"))                      # память сохраняется после каждой такой части (не теряется при обрыве)
 TIME_BUDGET_MIN = float(os.environ.get("TIME_BUDGET_MIN", "95"))   # не начинать новые части позже этого (запуск должен успеть сохраниться)
-PUBLISH_FAILS = int(os.environ.get("PUBLISH_FAILS", "1"))          # в n8n - рабочие, не ответившие не больше стольких раз подряд
+PUBLISH_FAILS = int(os.environ.get("PUBLISH_FAILS", "0"))          # в n8n - только ответившие при последней проверке (0 = без неудач)
 T_START = time.time()
 META = os.path.join(os.path.dirname(os.environ.get("STATE_FILE", "state/state.json")) or ".", "meta.json")   # когда была последняя крупная проверка
 def load_meta():
@@ -313,12 +314,13 @@ async def main():
                 e.update(status="alive", fails=0, last_checked=t1, last_alive=t1, protocol=r["protocol"], country=r["country"], latency=r["latency"], exit_ip=r.get("exit_ip", ""), anonymity=r.get("anonymity", "")); stat["alive_ok"] += 1
             else:
                 e["fails"] = e.get("fails", 0) + 1; e["last_checked"] = t1
-                # в мёртвые переводит только полный прогон: быстрые проверки не убирают рабочих из памяти
-                if MODE != "alive" and e["fails"] >= ALIVE_FAILS:   # несколько неудач подряд - в мёртвые, но перепроверим уже через 2 часа
+                # первая неудача - не выставляем и перепроверяем в следующем запуске; вторая подряд - убираем из рабочих
+                # (в любом режиме). В памяти остаётся мёртвым: крупная проверка перепроверяет всю память и может его вернуть
+                if e["fails"] >= ALIVE_FAILS:
                     e.update(status="dead", dead_n=1, next_check=now_plus_h(DEAD_BACKOFF_H[0])); stat["alive_dropped"] += 1
                 else: stat["alive_flaky"] += 1
-        print(f"рабочие ({'быстрая проверка' if MODE == 'alive' else 'полный прогон'}): ответили {stat['alive_ok']}, временно не ответили {stat['alive_flaky']}, выбыли после {ALIVE_FAILS} неудач подряд {stat['alive_dropped']}", flush=True)
-        if MODE != "alive": save_state(state)
+        print(f"рабочие ({'быстрая проверка' if MODE == 'alive' else 'полный прогон'}): ответили {stat['alive_ok']}, не ответили впервые (не выставляются, повтор в следующем запуске) {stat['alive_flaky']}, убраны после {ALIVE_FAILS} неудач подряд {stat['alive_dropped']}", flush=True)
+        save_state(state)
 
     # ── 2. полный прогон: новые из источников и мёртвые, у которых подошёл срок перепроверки (даже если источник их убрал) ──
     res = []
@@ -376,8 +378,13 @@ async def main():
                   anonymity=e.get("anonymity") or ("elite" if e.get("protocol") in ("socks4", "socks5") else ""))
              for a, e in state.items() if e["status"] == "alive" and e.get("fails", 0) <= PUBLISH_FAILS]   # одна случайная неудача не убирает из списка
     alive.sort(key=lambda x: x["latency"])
+    # метка выпуска: время + число строк. n8n пишет её в колонку run, сайт показывает ТОЛЬКО последний полностью записанный
+    # выпуск - поэтому на сайте ровно столько, сколько выставлено здесь (без остатков прошлых списков в таблице n8n)
+    run = now_iso() + "#" + str(len(alive))
+    for x in alive: x["run"] = run
     no_cc = sum(1 for x in alive if not x["country"])
-    print(f"рабочих сейчас: {len(alive)} (ещё {stat['alive_flaky']} временно не ответили и остаются в памяти рабочих), без страны: {no_cc}, база стран: {'есть' if _geo else 'НЕТ'}", flush=True)
+    waiting = sum(1 for e in state.values() if e.get("status") == "alive" and e.get("fails", 0) > PUBLISH_FAILS)
+    print(f"ВЫСТАВЛЕНО на сайт: {len(alive)} (ответили при последней проверке); ждут повторной проверки (не выставлены): {waiting}; без страны: {no_cc}, база стран: {'есть' if _geo else 'НЕТ'}", flush=True)
 
     # в n8n - одним запросом весь актуальный список рабочих: n8n заменяет им таблицу.
     # Нет связи, n8n перезапускается или не отвечает - повторяем с нарастающей паузой (10 с, 20 с, 40 с, дальше раз в минуту),
@@ -385,7 +392,7 @@ async def main():
     # память уже сохранена выше, а следующий запуск отправит более свежий список.
     if MODE != "alive": meta["last_full"] = datetime.fromtimestamp(T_START, timezone.utc).isoformat(timespec="seconds"); save_meta(meta)
     next_mode = "full" if full_due(meta) else "alive"   # n8n через минуту запустит именно такую проверку
-    payload = {"alive": alive, "count": len(alive), "updated": now_iso(), "mode": MODE, "next_mode": next_mode, "minutes": round((time.time() - T_START) / 60, 1), "run_id": os.environ.get("GITHUB_RUN_ID", "")}
+    payload = {"alive": alive, "count": len(alive), "run": run, "updated": now_iso(), "mode": MODE, "next_mode": next_mode, "minutes": round((time.time() - T_START) / 60, 1), "run_id": os.environ.get("GITHUB_RUN_ID", "")}
     print(f"следующая проверка: {'крупная' if next_mode == 'full' else 'быстрая'}", flush=True)
     deadline = T_START + SEND_UNTIL_MIN * 60
     attempt, pause, last_err = 0, 10, ""
