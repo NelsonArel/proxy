@@ -4,11 +4,14 @@
 В n8n уходит только итог - список рабочих (сотни строк), который заменяет таблицу целиком.
 
 Память хранится в файле state.json между запусками (кэш GitHub Actions), поэтому:
-  - новые адреса проверяются один раз;
-  - рабочие перепроверяются, если с последней проверки прошло RECHECK_ALIVE_MIN минут;
-  - мёртвые не проверяются повторно RECHECK_DEAD_H часов (источники иногда «воскрешают» адреса).
+  - новые адреса проверяются один раз, дальше - по расписанию ниже;
+  - рабочие перепроверяются каждый запуск ОТДЕЛЬНО от новых (своя умеренная нагрузка), с повтором при неудаче;
+    из рабочих прокси выбывает только после ALIVE_FAILS неудач подряд (бесплатные прокси «мигают»);
+  - мёртвые перепроверяются по нарастающей (2 ч, 6 ч, 24 ч, 72 ч) - даже если источник их уже убрал:
+    многие бесплатные прокси через время снова начинают работать;
+  - мёртвые хранятся KEEP_DEAD_D дней с последней удачной проверки.
 Поля результата: proxy, status, protocol, country, latency, last_checked, added."""
-import asyncio, json, os, re, time
+import asyncio, json, os, random, re, time
 from datetime import datetime, timezone
 import aiohttp
 from aiohttp_socks import ProxyConnector, ProxyType
@@ -23,6 +26,13 @@ RECHECK_DEAD_H = float(os.environ.get("RECHECK_DEAD_H", "72"))   # мёртвы�
 NEW_TIMEOUT = float(os.environ.get("NEW_TIMEOUT", "6"))            # таймаут для ещё не проверенных адресов
 MAX_NEW = int(os.environ.get("MAX_NEW", "150000"))                 # не больше стольких непроверенных за полный прогон - остальное в следующих
 STATE = os.environ.get("STATE_FILE", "state/state.json")
+ALIVE_FAILS = int(os.environ.get("ALIVE_FAILS", "3"))              # из рабочих - только после стольких неудач подряд
+ALIVE_CONC = int(os.environ.get("ALIVE_CONCURRENCY", "400"))       # рабочие - отдельно и без перегрузки (иначе ложные «смерти»)
+ALIVE_TIMEOUT = float(os.environ.get("ALIVE_TIMEOUT", "10"))
+RETRY_TIMEOUT = float(os.environ.get("RETRY_TIMEOUT", "15"))       # повтор не ответившего рабочего - другой адрес проверки, дольше
+DEAD_BACKOFF_H = [float(x) for x in os.environ.get("DEAD_BACKOFF_H", "2,6,24,72").split(",")]   # когда перепроверять мёртвые
+MAX_DEAD = int(os.environ.get("MAX_DEAD", "60000"))                # мёртвых на перепроверку за полный прогон
+KEEP_DEAD_D = float(os.environ.get("KEEP_DEAD_D", "21"))
 GEO = os.environ.get("GEO_DB", "geo.mmdb")        # база стран DB-IP (dbip-country-lite, CC BY 4.0)
 HEADERS = {"Authorization": "Bearer " + AUTH} if AUTH else {}
 
@@ -173,14 +183,14 @@ async def anonymity(proto, addr, my):
         return "anonymous" if LEAK.search(text) else "elite"
     return ""
 
-async def check(addr, protos, my, sem, timeout=None):
+async def check(addr, protos, my, sem, timeout=None, shift=0):
     timeout = timeout or TIMEOUT
     async with sem:
         for proto in sorted(protos, key=lambda p: -RANK.get(p, 0)):
             t0 = time.monotonic()
             try:
                 async with aiohttp.ClientSession(connector=connector(proto, addr)) as s:
-                    async with s.get(CHECK_URLS[hash(addr) % len(CHECK_URLS)], timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+                    async with s.get(CHECK_URLS[(hash(addr) + shift) % len(CHECK_URLS)], timeout=aiohttp.ClientTimeout(total=timeout)) as r:
                         if r.status != 200: continue
                         text = await r.text()
             except Exception:
@@ -202,6 +212,13 @@ def load_state():
 def save_state(st):
     os.makedirs(os.path.dirname(STATE), exist_ok=True)
     with open(STATE, "w") as f: json.dump(st, f)
+
+def now_plus_h(h):
+    return datetime.fromtimestamp(time.time() + h * 3600, timezone.utc).isoformat(timespec="seconds")
+
+def due(iso):   # срок наступил?
+    try: return datetime.fromisoformat(iso) <= datetime.now(timezone.utc)
+    except Exception: return True
 
 def age_min(iso):
     try: return (datetime.now(timezone.utc) - datetime.fromisoformat(iso)).total_seconds() / 60
@@ -248,40 +265,67 @@ async def main():
         dead_src = [u for u, n in stat.items() if n == -1]
         print(f"источников не ответило: {len(dead_src)}" + (" (" + ", ".join(u.split("/")[2] for u in dead_src[:8]) + ")" if dead_src else ""), flush=True)
 
-    # что проверять: новые; рабочие, давно не проверенные; мёртвые, у которых истёк срок
-    todo = {}
-    for addr, protos in found.items():
-        e = state.get(addr)
-        if not e:
-            todo[addr] = set(protos); continue          # новый - только по заявленному протоколу (втрое быстрее)
-        if e["status"] == "alive" and age_min(e.get("last_checked", "")) >= RECHECK_ALIVE_MIN:
-            todo[addr] = {e.get("protocol", "http")} | protos
-        elif e["status"] == "dead" and age_min(e.get("last_checked", "")) >= RECHECK_DEAD_H * 60:
-            todo[addr] = set(protos)
-    # рабочие, которые пропали из источников, тоже перепроверяем (иначе протухнут в списке).
-    # В быстром режиме (alive) рабочие проверяются ВСЕГДА: запуски идут каждые 10 минут, а с прошлой проверки
-    # к этому моменту проходит чуть меньше 10 минут - с порогом по возрасту каждый второй запуск ничего не делал.
-    for addr, e in state.items():
-        if addr not in todo and e["status"] == "alive" and (MODE == "alive" or age_min(e.get("last_checked", "")) >= RECHECK_ALIVE_MIN):
-            todo[addr] = {e.get("protocol", "http"), "http", "socks5"}
-    # лимит непроверенных за прогон: рабочие проверяются всегда, остальные - не больше MAX_NEW (остаток - в следующих прогонах)
-    alive_set = {a for a, e in state.items() if e.get("status") == "alive"}
-    rest = [a for a in todo if a not in alive_set]
-    if len(rest) > MAX_NEW:
-        for a in rest[MAX_NEW:]: del todo[a]
-        print(f"непроверенных больше лимита: {len(rest)}, сейчас берём {MAX_NEW}, остальные - в следующих полных прогонах", flush=True)
-    print(f"проверяем сейчас: {len(todo)} (из них рабочих на перепроверку: {len(alive_set & set(todo))})", flush=True)
-
-    sem = asyncio.Semaphore(CONC)
-    res = await asyncio.gather(*[check(a, p, my, sem, TIMEOUT if a in alive_set else NEW_TIMEOUT) for a, p in todo.items()])
     t = now_iso()
-    for addr, r in res:
-        prev = state.get(addr, {})
-        rec = {"status": r["status"], "last_checked": t, "added": prev.get("added", t)}
-        if r["status"] == "alive": rec.update(protocol=r["protocol"], country=r["country"], latency=r["latency"], exit_ip=r.get("exit_ip", ""), anonymity=r.get("anonymity", ""))
-        state[addr] = rec
-    # чистим память от мёртвых старше недели, чтобы файл не рос бесконечно
-    state = {a: e for a, e in state.items() if not (e["status"] == "dead" and age_min(e.get("last_checked", "")) > 7 * 24 * 60)}
+    stat = {"alive_ok": 0, "alive_flaky": 0, "alive_dropped": 0, "revived": 0, "new_alive": 0, "dead_checked": 0, "new_checked": 0}
+
+    # ── 1. рабочие: каждый запуск, отдельно от новых (своя умеренная нагрузка), повтор при неудаче ──
+    alive_set = [a for a, e in state.items() if e.get("status") == "alive"]
+    if alive_set:
+        sem_a = asyncio.Semaphore(ALIVE_CONC)
+        protos_of = lambda a: {state[a].get("protocol", "http")} | set(found.get(a, set())) if state[a].get("protocol") else {"http", "socks5", "socks4"} | set(found.get(a, set()))
+        res_a = dict(await asyncio.gather(*[check(a, protos_of(a), my, sem_a, ALIVE_TIMEOUT) for a in alive_set]))
+        retry = [a for a, r in res_a.items() if r["status"] != "alive"]
+        if retry:   # не ответил - ещё раз: другой адрес проверки и таймаут дольше (сеть и сайты проверки тоже иногда тормозят)
+            res_a.update(dict(await asyncio.gather(*[check(a, protos_of(a), my, sem_a, RETRY_TIMEOUT, shift=1) for a in retry])))
+        for a, r in res_a.items():
+            e = state[a]
+            if r["status"] == "alive":
+                e.update(status="alive", fails=0, last_checked=t, last_alive=t, protocol=r["protocol"], country=r["country"], latency=r["latency"], exit_ip=r.get("exit_ip", ""), anonymity=r.get("anonymity", "")); stat["alive_ok"] += 1
+            else:
+                e["fails"] = e.get("fails", 0) + 1; e["last_checked"] = t
+                if e["fails"] >= ALIVE_FAILS:   # несколько неудач подряд - в мёртвые, но перепроверим уже через 2 часа
+                    e.update(status="dead", dead_n=1, next_check=now_plus_h(DEAD_BACKOFF_H[0])); stat["alive_dropped"] += 1
+                else: stat["alive_flaky"] += 1
+        print(f"рабочие: ответили {stat['alive_ok']}, временно не ответили {stat['alive_flaky']}, выбыли после {ALIVE_FAILS} неудач подряд {stat['alive_dropped']}", flush=True)
+
+    # ── 2. полный прогон: новые из источников и мёртвые, у которых подошёл срок перепроверки (даже если источник их убрал) ──
+    res = []
+    if MODE != "alive":
+        new = [a for a in found if a not in state]
+        if len(new) > MAX_NEW:
+            print(f"новых больше лимита: {len(new)}, сейчас берём {MAX_NEW}, остальные - в следующих полных прогонах", flush=True); new = new[:MAX_NEW]
+        # старые записи без расписания (накопленные прежней версией): перепроверяем все в ближайшие сутки, вразброс -
+        # среди них много прокси, которые уже снова работают
+        for e in state.values():
+            if e.get("status") == "dead" and "next_check" not in e:
+                e["dead_n"] = 2; e["next_check"] = now_plus_h(random.random() * 24)
+        dead = [a for a, e in state.items() if e.get("status") == "dead" and due(e.get("next_check", ""))]
+        dead.sort(key=lambda a: (state[a].get("dead_n", 9), state[a].get("next_check", "")))   # сначала недавно умершие - они чаще оживают
+        if len(dead) > MAX_DEAD: dead = dead[:MAX_DEAD]
+        stat["new_checked"], stat["dead_checked"] = len(new), len(dead)
+        print(f"проверяем: новых {len(new)}, мёртвых по расписанию {len(dead)} (всего в памяти {len(state)})", flush=True)
+        sem = asyncio.Semaphore(CONC)
+        jobs = [check(a, set(found[a]), my, sem, NEW_TIMEOUT) for a in new]
+        jobs += [check(a, set(found.get(a, set())) | ({state[a]["protocol"]} if state[a].get("protocol") else {"http", "socks5", "socks4"}), my, sem, TIMEOUT) for a in dead]
+        res = await asyncio.gather(*jobs)
+        for addr, r in res:
+            prev = state.get(addr)
+            if r["status"] == "alive":
+                if prev and prev.get("status") == "dead": stat["revived"] += 1
+                elif not prev: stat["new_alive"] += 1
+                state[addr] = {"status": "alive", "fails": 0, "last_checked": t, "last_alive": t, "added": (prev or {}).get("added", t), "protocol": r["protocol"], "country": r["country"],
+                               "latency": r["latency"], "exit_ip": r.get("exit_ip", ""), "anonymity": r.get("anonymity", "")}
+            else:
+                n = ((prev or {}).get("dead_n", 0) if prev and prev.get("status") == "dead" else 0) + 1
+                state[addr] = {"status": "dead", "dead_n": n, "last_checked": t, "next_check": now_plus_h(DEAD_BACKOFF_H[min(n - 1, len(DEAD_BACKOFF_H) - 1)]),
+                               "added": (prev or {}).get("added", t), "last_alive": (prev or {}).get("last_alive", ""), "protocol": (prev or {}).get("protocol", "")}
+        print(f"итог полного прогона: новых рабочих {stat['new_alive']}, ожили {stat['revived']}", flush=True)
+
+    # ── 3. уборка: мёртвые, которые долго не работали (KEEP_DEAD_D дней с последней удачи или с добавления) ──
+    keep_min = KEEP_DEAD_D * 24 * 60
+    before = len(state)
+    state = {a: e for a, e in state.items() if not (e.get("status") == "dead" and e.get("dead_n", 0) >= len(DEAD_BACKOFF_H) and age_min(e.get("last_alive") or e.get("added", "")) > keep_min)}
+    if before != len(state): print(f"удалено из памяти давно мёртвых: {before - len(state)}", flush=True)
     save_state(state)
 
     for a, e in state.items():
@@ -290,10 +334,10 @@ async def main():
     alive = [dict(proxy=a, status="alive", protocol=e.get("protocol", ""), country=e.get("country", ""),
                   latency=e.get("latency", 0), last_checked=e.get("last_checked", ""), added=e.get("added", ""),
                   anonymity=e.get("anonymity") or ("elite" if e.get("protocol") in ("socks4", "socks5") else ""))
-             for a, e in state.items() if e["status"] == "alive"]
+             for a, e in state.items() if e["status"] == "alive" and e.get("fails", 0) == 0]   # только ответившие в последней проверке
     alive.sort(key=lambda x: x["latency"])
     no_cc = sum(1 for x in alive if not x["country"])
-    print(f"рабочих сейчас: {len(alive)} (проверено в этом запуске {len(res)}), без страны: {no_cc}, база стран: {'есть' if _geo else 'НЕТ'}", flush=True)
+    print(f"рабочих сейчас: {len(alive)} (ещё {stat['alive_flaky']} временно не ответили и остаются в памяти рабочих), без страны: {no_cc}, база стран: {'есть' if _geo else 'НЕТ'}", flush=True)
 
     # в n8n - одним запросом весь актуальный список рабочих: n8n заменяет им таблицу
     async with aiohttp.ClientSession(headers=HEADERS) as s:
