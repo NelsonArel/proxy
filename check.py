@@ -39,6 +39,7 @@ CHUNK = int(os.environ.get("CHUNK", "40000"))                      # памят�
 TIME_BUDGET_MIN = float(os.environ.get("TIME_BUDGET_MIN", "95"))   # не начинать новые части позже этого (запуск должен успеть сохраниться)
 PUBLISH_FAILS = int(os.environ.get("PUBLISH_FAILS", "1"))          # в n8n - рабочие, не ответившие не больше стольких раз подряд
 T_START = time.time()
+SEND_UNTIL_MIN = float(os.environ.get("SEND_UNTIL_MIN", "105"))     # до какой минуты запуска повторять отправку в n8n
 GEO = os.environ.get("GEO_DB", "geo.mmdb")        # база стран DB-IP (dbip-country-lite, CC BY 4.0)
 HEADERS = {"Authorization": "Bearer " + AUTH} if AUTH else {}
 
@@ -283,12 +284,13 @@ async def main():
         retry = [a for a, r in res_a.items() if r["status"] != "alive"]
         if retry:   # не ответил - ещё раз: другой адрес проверки и таймаут дольше (сеть и сайты проверки тоже иногда тормозят)
             res_a.update(dict(await asyncio.gather(*[check(a, protos_of(a), my, sem_a, RETRY_TIMEOUT, shift=1) for a in retry])))
+        t1 = now_iso()   # время окончания проверки рабочих
         for a, r in res_a.items():
             e = state[a]
             if r["status"] == "alive":
-                e.update(status="alive", fails=0, last_checked=t, last_alive=t, protocol=r["protocol"], country=r["country"], latency=r["latency"], exit_ip=r.get("exit_ip", ""), anonymity=r.get("anonymity", "")); stat["alive_ok"] += 1
+                e.update(status="alive", fails=0, last_checked=t1, last_alive=t1, protocol=r["protocol"], country=r["country"], latency=r["latency"], exit_ip=r.get("exit_ip", ""), anonymity=r.get("anonymity", "")); stat["alive_ok"] += 1
             else:
-                e["fails"] = e.get("fails", 0) + 1; e["last_checked"] = t
+                e["fails"] = e.get("fails", 0) + 1; e["last_checked"] = t1
                 # в мёртвые переводит только полный прогон: быстрые проверки не убирают рабочих из памяти
                 if MODE != "alive" and e["fails"] >= ALIVE_FAILS:   # несколько неудач подряд - в мёртвые, но перепроверим уже через 2 часа
                     e.update(status="dead", dead_n=1, next_check=now_plus_h(DEAD_BACKOFF_H[0])); stat["alive_dropped"] += 1
@@ -326,7 +328,8 @@ async def main():
                 if r["status"] == "alive":
                     if prev and prev.get("status") == "dead": stat["revived"] += 1
                     elif not prev: stat["new_alive"] += 1
-                    state[addr] = {"status": "alive", "fails": 0, "last_checked": t, "last_alive": t, "added": (prev or {}).get("added", t), "protocol": r["protocol"], "country": r["country"],
+                    tn = now_iso()
+                    state[addr] = {"status": "alive", "fails": 0, "last_checked": tn, "last_alive": tn, "added": (prev or {}).get("added", tn), "protocol": r["protocol"], "country": r["country"],
                                    "latency": r["latency"], "exit_ip": r.get("exit_ip", ""), "anonymity": r.get("anonymity", "")}
                 else:
                     n = ((prev or {}).get("dead_n", 0) if prev and prev.get("status") == "dead" else 0) + 1
@@ -354,13 +357,29 @@ async def main():
     no_cc = sum(1 for x in alive if not x["country"])
     print(f"рабочих сейчас: {len(alive)} (ещё {stat['alive_flaky']} временно не ответили и остаются в памяти рабочих), без страны: {no_cc}, база стран: {'есть' if _geo else 'НЕТ'}", flush=True)
 
-    # в n8n - одним запросом весь актуальный список рабочих: n8n заменяет им таблицу
-    async with aiohttp.ClientSession(headers=HEADERS) as s:
-        async with s.post(RESULT_URL, json={"alive": alive, "count": len(alive), "updated": t}, timeout=aiohttp.ClientTimeout(total=120)) as r:
-            print(f"отправлено в n8n: HTTP {r.status}", flush=True)
-            if r.status >= 300:
-                # запуск станет красным в Actions - сразу видно, что результат не дошёл до таблицы
-                raise SystemExit(f"n8n не принял результат (HTTP {r.status}): проверьте адрес RESULT_URL, включён ли workflow и совпадает ли WEBHOOK_TOKEN")
+    # в n8n - одним запросом весь актуальный список рабочих: n8n заменяет им таблицу.
+    # Нет связи, n8n перезапускается или не отвечает - повторяем с нарастающей паузой (10 с, 20 с, 40 с, дальше раз в минуту),
+    # пока n8n не примет. Предел - SEND_UNTIL_MIN минут от начала запуска (запуск на GitHub ограничен по времени);
+    # память уже сохранена выше, а следующий запуск отправит более свежий список.
+    payload = {"alive": alive, "count": len(alive), "updated": now_iso()}
+    deadline = T_START + SEND_UNTIL_MIN * 60
+    attempt, pause, last_err = 0, 10, ""
+    while True:
+        attempt += 1
+        try:
+            async with aiohttp.ClientSession(headers=HEADERS) as s:
+                async with s.post(RESULT_URL, json=payload, timeout=aiohttp.ClientTimeout(total=120)) as r:
+                    if r.status < 300:
+                        print(f"отправлено в n8n: HTTP {r.status}" + (f" (с попытки {attempt})" if attempt > 1 else ""), flush=True); return
+                    last_err = f"HTTP {r.status}"
+        except Exception as e:
+            last_err = type(e).__name__ + (": " + str(e)[:120] if str(e) else "")
+        if time.time() + pause > deadline:
+            # запуск станет красным - видно, что результат не дошёл (обычно: адрес RESULT_URL, выключен workflow или не совпадает WEBHOOK_TOKEN)
+            raise SystemExit(f"n8n так и не принял результат за {attempt} попыток ({last_err}). Память сохранена, следующий запуск отправит свежий список")
+        print(f"n8n недоступен ({last_err}), попытка {attempt}; следующая через {pause} с", flush=True)
+        await asyncio.sleep(pause)
+        pause = min(60, pause * 2)
 
 if __name__ == "__main__":
     asyncio.run(main())
